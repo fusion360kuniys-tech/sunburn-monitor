@@ -1,3 +1,5 @@
 streamlit
 pandas
 plotly
+SQLAlchemy
+psycopg2-binary
