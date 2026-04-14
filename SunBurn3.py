@@ -1,83 +1,83 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import sqlite3
+from sqlalchemy import create_engine, text
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ==========================================
-# 1. 基本設定
+# 1. 基本設定とタイムゾーン（日本時間）
 # ==========================================
-DB_NAME = "greenhouse_data.db"
 SAVE_INTERVAL_SEC = 60
 VIEW_INTERVAL_SEC = 5
 SUNBURN_LIMIT_MINUTES = int(2.2 * 60) # 2.2時間 = 132分
-NOTIFICATION_COOLDOWN_SEC = 300 # 通知のクールダウン（5分）
+NOTIFICATION_COOLDOWN_SEC = 300 # 5分
+
+JST = timezone(timedelta(hours=+9), 'JST')
 
 # ==========================================
-# 2. セッションステートの初期化
+# 2. データベース接続（Supabase）
+# ==========================================
+@st.cache_resource
+def init_connection():
+    # Streamlit CloudのSecretsからURLを取得して接続
+    db_url = st.secrets["SUPABASE_URL"]
+    return create_engine(db_url)
+
+engine = init_connection()
+
+# ==========================================
+# 3. セッションステートの初期化
 # ==========================================
 if 'last_saved_time' not in st.session_state:
-    st.session_state.last_saved_time = None # 初回保存判定用
+    st.session_state.last_saved_time = None 
 if 'last_notification_time' not in st.session_state:
-    st.session_state.last_notification_time = datetime.min
+    st.session_state.last_notification_time = datetime.min.replace(tzinfo=JST)
 
 # ==========================================
-# 3. ロジック関数
+# 4. ロジック関数（SQLAlchemy仕様に変更）
 # ==========================================
-def init_db():
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS sensor_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, 
-                temperature REAL,
-                solar_rad REAL,
-                fruit_temp REAL,
-                limit_temp REAL,
-                is_alert INTEGER,
-                reset_flag INTEGER DEFAULT 0
-            )
-        """)
-        # 既存DBへのカラム追加（エラー回避）
-        try:
-            conn.execute("ALTER TABLE sensor_logs ADD COLUMN limit_temp REAL")
-        except sqlite3.OperationalError:
-            pass
-
 def save_to_db(t, s, f, limit_t, alert):
-    now_jst = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute(
-            "INSERT INTO sensor_logs (timestamp, temperature, solar_rad, fruit_temp, limit_temp, is_alert, reset_flag) VALUES (?, ?, ?, ?, ?, ?, 0)",
-            (now_jst, t, s, f, limit_t, 1 if alert else 0)
-        )
+    now_jst = datetime.now(JST).strftime('%Y-%m-%d %H:%M:%S%z')
+    with engine.begin() as conn:
+        query = text("""
+            INSERT INTO sensor_logs (timestamp, temperature, solar_rad, fruit_temp, limit_temp, is_alert, reset_flag) 
+            VALUES (:ts, :t, :s, :f, :lt, :a, 0)
+        """)
+        conn.execute(query, {"ts": now_jst, "t": t, "s": s, "f": f, "lt": limit_t, "a": 1 if alert else 0})
 
 def get_accumulated_minutes():
-    with sqlite3.connect(DB_NAME) as conn:
-        query = "SELECT COUNT(*) FROM sensor_logs WHERE is_alert = 1 AND reset_flag = 0"
-        return conn.execute(query).fetchone()[0]
+    with engine.connect() as conn:
+        query = text("SELECT COUNT(*) FROM sensor_logs WHERE is_alert = 1 AND reset_flag = 0")
+        result = conn.execute(query).fetchone()
+        return result[0] if result else 0
+
+def reset_accumulation():
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE sensor_logs SET reset_flag = 1 WHERE reset_flag = 0"))
+        st.success("累積ダメージをリセットしました。")
 
 def load_data_range(start_date, end_date):
-    with sqlite3.connect(DB_NAME) as conn:
-        query = "SELECT timestamp, temperature, solar_rad, fruit_temp, limit_temp, is_alert, reset_flag FROM sensor_logs WHERE timestamp BETWEEN ? AND ?"
-        df = pd.read_sql_query(query, conn, params=(
-            start_date.strftime('%Y-%m-%d 00:00:00'), 
-            end_date.strftime('%Y-%m-%d 23:59:59')
-        ))
+    with engine.connect() as conn:
+        query = text("SELECT timestamp, temperature, solar_rad, fruit_temp, limit_temp, is_alert, reset_flag FROM sensor_logs WHERE timestamp BETWEEN :start AND :end")
+        df = pd.read_sql_query(query, conn, params={
+            "start": start_date.strftime('%Y-%m-%d 00:00:00%z'), 
+            "end": end_date.strftime('%Y-%m-%d 23:59:59%z')
+        })
         if not df.empty:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
-            # 累積計算
+            df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(JST)
             df['acc_mins'] = (df['is_alert'] & (df['reset_flag'] == 0)).cumsum()
         return df
 
 def get_csv_download_data(target_date):
-    with sqlite3.connect(DB_NAME) as conn:
-        query = "SELECT timestamp, temperature, solar_rad, fruit_temp, limit_temp, is_alert FROM sensor_logs WHERE timestamp LIKE ?"
-        df = pd.read_sql_query(query, conn, params=(f"{target_date.strftime('%Y-%m-%d')}%",))
-        # CSV出力用に日本語カラム名に変換（オプション）
-        df.columns = ["日時", "気温(℃)", "日射量(W/m²)", "果実温度(℃)", "限界温度閾値(℃)", "アラート判定"]
+    with engine.connect() as conn:
+        # PostgreSQLの仕様に合わせてCASTを使用
+        query = text("SELECT timestamp, temperature, solar_rad, fruit_temp, limit_temp, is_alert FROM sensor_logs WHERE CAST(timestamp AS TEXT) LIKE :date")
+        df = pd.read_sql_query(query, conn, params={"date": f"{target_date.strftime('%Y-%m-%d')}%"})
+        if not df.empty:
+            df['timestamp'] = pd.to_datetime(df['timestamp']).dt.tz_convert(JST).dt.strftime('%Y-%m-%d %H:%M:%S')
+            df.columns = ["日時", "気温(℃)", "日射量(W/m²)", "果実温度(℃)", "限界温度閾値(℃)", "アラート判定"]
         return df
 
 def calculate_default_threshold(solar):
@@ -91,7 +91,7 @@ def calculate_default_threshold(solar):
         return 47.0
 
 # ==========================================
-# 4. UI 構築
+# 5. UI 構築
 # ==========================================
 st.set_page_config(page_title="Sunburn Monitor", layout="wide")
 
@@ -101,19 +101,17 @@ st.title("🌿 園芸施設：日焼けダメージ蓄積モニタリング")
 
 # --- サイドバー ---
 st.sidebar.header("🛠️ 管理設定")
-export_date = st.sidebar.date_input("ログ出力日を選択", datetime.now())
+export_date = st.sidebar.date_input("ログ出力日を選択", datetime.now(JST))
 if st.sidebar.button("CSVデータを生成"):
     csv_df = get_csv_download_data(export_date)
     if not csv_df.empty:
         csv_data = csv_df.to_csv(index=False).encode('utf-8-sig')
         st.sidebar.download_button("📥 CSVダウンロード", csv_data, f"log_{export_date}.csv", "text/csv")
     else:
-        st.sidebar.warning("データがありません。")
+        st.sidebar.warning("指定された日付のデータがありません。")
 
 if st.sidebar.button("🚨 累積ダメージをリセット"):
-    with sqlite3.connect(DB_NAME) as conn:
-        conn.execute("UPDATE sensor_logs SET reset_flag = 1 WHERE reset_flag = 0")
-    st.sidebar.success("リセットしました")
+    reset_accumulation()
 
 st.sidebar.subheader("⚙️ 判定モード")
 threshold_mode = st.sidebar.radio("ロジック", ("デフォルト", "カスタム"))
@@ -126,30 +124,26 @@ if threshold_mode == "カスタム":
         param_a = (p2_temp - p1_temp) / (p2_solar - p1_solar)
         param_b = p1_temp - (param_a * p1_solar)
 
-# グラフ・メトリクス表示エリア
 metrics_area = st.empty()
 chart_solar = st.empty()
 chart_temp = st.empty()
 chart_acc = st.empty()
 
-init_db()
-
 # ==========================================
-# 5. メインループ
+# 6. メインループ
 # ==========================================
 try:
-    now = datetime.now()
+    now = datetime.now(JST)
     
-    # 擬似データ生成
+    # 【今はダミーデータでテスト】※後でここを削除し、DBからの読み込み専用にします
     t = round(random.uniform(25.0, 35.0), 1)
     s = round(random.uniform(500.0, 950.0), 1) 
     f = round(random.uniform(45.0, 55.0), 1)
 
-    # 閾値計算
     limit_t = round(calculate_default_threshold(s) if threshold_mode == "デフォルト" else (param_a * s + param_b), 2)
     is_current_alert = f > limit_t
     
-    # データ保存ロジック（初回またはSAVE_INTERVAL経過後）
+    # 60秒に1回、Supabaseへデータを保存
     if st.session_state.last_saved_time is None or (now - st.session_state.last_saved_time).total_seconds() >= SAVE_INTERVAL_SEC:
         save_to_db(t, s, f, limit_t, is_current_alert)
         st.session_state.last_saved_time = now 
@@ -157,17 +151,15 @@ try:
     acc_mins = get_accumulated_minutes()
     display_df = load_data_range(now - timedelta(days=1), now).tail(100)
     
-    # --- アラート表示 ---
+    # --- UI更新 ---
     with critical_area:
         if acc_mins >= SUNBURN_LIMIT_MINUTES:
             st.error(f"🔥 【重大警告】累積ダメージが限界({SUNBURN_LIMIT_MINUTES}分)を超過しました！")
 
     with alert_area:
         if is_current_alert:
-            # 1. 表示：温度を超えている間は「常に」赤色で表示
             st.error(f"🚨 【現在】果実温度が限界超過中！ ({f}℃ > {limit_t}℃)")
             
-            # 2. 通知：外部通知（シミュレーション）は5分間隔に制限
             time_since_notif = (now - st.session_state.last_notification_time).total_seconds()
             if time_since_notif >= NOTIFICATION_COOLDOWN_SEC:
                 st.toast(f"管理者へ通知を送信しました: {f}℃")
@@ -175,7 +167,6 @@ try:
         else:
             st.success(f"✅ 正常（限界温度: {limit_t}℃）")
 
-    # --- メトリクス表示 ---
     with metrics_area.container():
         m1, m2, m3, m4 = st.columns(4)
         st.caption(f"最終更新: {now.strftime('%H:%M:%S')}")
@@ -184,14 +175,12 @@ try:
         m3.metric("日射量", f"{int(s)} W/m²")
         m4.metric("累積", f"{acc_mins} 分")
 
-    # --- グラフ表示 ---
     if not display_df.empty:
         with chart_solar:
             fig_s = px.line(display_df, x='timestamp', y='solar_rad', title="日射量 (W/m²)", color_discrete_sequence=["#FECB52"])
             st.plotly_chart(fig_s, use_container_width=True, key="s")
         
         with chart_temp:
-            # グラフ描画用にlimit_tempを現在設定で再計算（描画をスムーズにするため）
             if threshold_mode == "デフォルト":
                 display_df['limit_temp'] = display_df['solar_rad'].apply(calculate_default_threshold)
             else:
@@ -207,7 +196,7 @@ try:
             fig_a.add_hline(y=SUNBURN_LIMIT_MINUTES, line_dash="dot", line_color="red")
             st.plotly_chart(fig_a, use_container_width=True, key="a")
     else:
-        st.info("📊 データを蓄積しています。最初の保存までしばらくお待ちください...")
+        st.info("📊 データベース(Supabase)へ接続中... 最初のデータ保存まで約1分お待ちください。")
 
     time.sleep(VIEW_INTERVAL_SEC)
     st.rerun()
